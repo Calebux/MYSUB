@@ -1,0 +1,30 @@
+# Credentials — never commit these
+.env
+alerts_config.json
+sent_alerts.json
+
+# Output data
+subscriptions.jsonl
+report.json
+scheduler.log
+
+# Stray pip artefacts
+=*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
