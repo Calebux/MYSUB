@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { apiFetch } from './api';
 import ConnectStep from './components/ConnectStep';
 import ScanningStep from './components/ScanningStep';
 import ActionsStep from './components/ActionsStep';
@@ -49,9 +50,23 @@ function App() {
   const [markedForCancel, setMarkedForCancel] = useState<Set<string>>(new Set());
   const [healthScores, setHealthScores] = useState<any[]>([]);
 
+  // Silently obtain auth token on startup so all API calls work
+  useEffect(() => {
+    if (!localStorage.getItem('subtrack_token')) {
+      fetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: 'subtrack' }),
+      })
+        .then(r => r.json())
+        .then(d => { if (d.token) localStorage.setItem('subtrack_token', d.token); })
+        .catch(() => {});
+    }
+  }, []);
+
   const fetchReport = () => {
     setLoading(true);
-    fetch('/api/report')
+    apiFetch('/api/report')
       .then(res => res.json())
       .then(data => {
         if (!data.error) {
@@ -66,7 +81,7 @@ function App() {
   };
 
   const fetchHealthScores = () => {
-    fetch('/api/health-score')
+    apiFetch('/api/health-score')
       .then(res => res.json())
       .then(data => setHealthScores(data.subscriptions || []))
       .catch(err => console.error('Failed to fetch health scores', err));
@@ -78,9 +93,8 @@ function App() {
     if (shouldMark) newMarked.add(merchant);
     else newMarked.delete(merchant);
     setMarkedForCancel(newMarked);
-    fetch('/api/cancellation/mark', {
+    apiFetch('/api/cancellation/mark', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ merchant, mark: shouldMark }),
     }).catch(console.error);
   };
@@ -443,7 +457,7 @@ function App() {
                               href={`/api/cancellation`}
                               onClick={(e) => {
                                 e.preventDefault();
-                                fetch('/api/cancellation')
+                                apiFetch('/api/cancellation')
                                   .then(r => r.json())
                                   .then(data => {
                                     const s = data.subscriptions?.find((x: any) => x.merchant === sub.merchant);

@@ -332,6 +332,7 @@ def run_parser(
     email_addr: str,
     app_password: str,
     progress_callback=None,
+    output_file: str = None,
 ) -> list[dict]:
     """
     Connect to Gmail, search for subscription-related emails, parse, and
@@ -345,6 +346,7 @@ def run_parser(
     Returns:
         List of newly parsed subscription records.
     """
+    out_path = Path(output_file) if output_file else OUTPUT_FILE
     mail = connect_imap(email_addr, app_password)
 
     # ── Target Gmail's Subscriptions category first (much smaller set) ────────
@@ -376,13 +378,23 @@ def run_parser(
         all_uids = list(combined_uids)
         log.info(f"INBOX keyword search: {len(all_uids)} candidate emails.")
 
-    already_parsed = load_parsed_ids()
+    # Load already-parsed IDs from the user-specific output file
+    already_parsed: set = set()
+    if out_path.exists():
+        with out_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        already_parsed.add(json.loads(line)["id"])
+                    except (json.JSONDecodeError, KeyError):
+                        pass
     log.info(f"Resuming: {len(already_parsed)} already parsed, skipping them.")
 
     new_records: list[dict] = []
     processed = 0
 
-    with OUTPUT_FILE.open("a") as out_f:
+    with out_path.open("a") as out_f:
         for i, uid in enumerate(all_uids):
             uid_str = uid.decode() if isinstance(uid, bytes) else uid
 
@@ -415,7 +427,7 @@ def run_parser(
                 progress_callback(i + 1, len(all_uids), record)
 
     mail.logout()
-    log.info(f"Done. Parsed {processed} new subscription emails → {OUTPUT_FILE}")
+    log.info(f"Done. Parsed {processed} new subscription emails → {out_path}")
     return new_records
 
 

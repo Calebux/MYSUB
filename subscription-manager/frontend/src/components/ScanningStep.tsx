@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { apiFetch } from '../api';
 
 export default function ScanningStep({ onComplete, onCancel }: { onComplete: () => void, onCancel: () => void }) {
     const [progress, setProgress] = useState({ current: 0, total: 100, status: 'Scanning your inbox...' });
@@ -8,7 +9,7 @@ export default function ScanningStep({ onComplete, onCancel }: { onComplete: () 
         // Poll the backend for parsing progress
         const interval = setInterval(async () => {
             try {
-                const res = await fetch("/api/progress");
+                const res = await apiFetch("/api/progress");
                 const data = await res.json();
 
                 if (data.status === "done") {
@@ -40,7 +41,7 @@ export default function ScanningStep({ onComplete, onCancel }: { onComplete: () 
 
     const handleCancel = async () => {
         try {
-            await fetch("/api/cancel", { method: "POST" });
+            await apiFetch("/api/cancel", { method: "POST" });
         } catch (e) { }
         onCancel();
     }

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Mail, KeyRound, AlertCircle, ArrowRight } from 'lucide-react';
+import { apiFetch } from '../api';
 
 export default function ConnectStep({ onConnect }: { onConnect: (email: string, appPw: string) => void }) {
     const [email, setEmail] = useState('');
@@ -15,9 +16,8 @@ export default function ConnectStep({ onConnect }: { onConnect: (email: string, 
         }
         setLoading(true);
         try {
-            const res = await fetch("/api/connect", {
+            const res = await apiFetch("/api/connect", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ email, password: appPassword })
             });
             const data = await res.json();

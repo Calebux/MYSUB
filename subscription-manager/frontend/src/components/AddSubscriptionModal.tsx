@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Plus, X } from 'lucide-react';
+import { apiFetch } from '../api';
 
 interface Props {
     onClose: () => void;
@@ -23,7 +24,7 @@ export default function AddSubscriptionModal({ onClose, onAdded }: Props) {
         setSaving(true);
         setError('');
         try {
-            const res = await fetch('/api/subscriptions/add', {
+            const res = await apiFetch('/api/subscriptions/add', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({

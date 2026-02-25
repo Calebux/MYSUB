@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -9,6 +9,7 @@ import threading
 import time
 import logging
 import secrets
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel
@@ -20,13 +21,18 @@ log = logging.getLogger("api")
 
 app = FastAPI(title="SubTrack API")
 
-# ── Simple shared-password auth ───────────────────────────────────────────────
-# Set ACCESS_PASSWORD env var, or it defaults to "subtrack" for local dev
+# ── Auth ───────────────────────────────────────────────────────────────────────
 ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "subtrack")
-ACTIVE_TOKENS: set = set()
+# token → email (empty string until the user calls /api/connect)
+ACTIVE_TOKENS: Dict[str, str] = {}
 
 
 class LoginRequest(BaseModel):
+    password: str
+
+
+class Credentials(BaseModel):
+    email: str
     password: str
 
 
@@ -34,7 +40,7 @@ class LoginRequest(BaseModel):
 def auth_login(req: LoginRequest):
     if req.password == ACCESS_PASSWORD:
         token = secrets.token_urlsafe(32)
-        ACTIVE_TOKENS.add(token)
+        ACTIVE_TOKENS[token] = ""
         return {"status": "success", "token": token}
     return {"status": "error", "message": "Wrong password."}
 
@@ -42,7 +48,6 @@ def auth_login(req: LoginRequest):
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
-    # Allow: auth endpoints, static files, root
     if (path.startswith("/auth/") or
         path.startswith("/assets/") or
         path == "/" or
@@ -55,44 +60,58 @@ async def auth_middleware(request: Request, call_next):
         path.endswith(".ico")):
         return await call_next(request)
 
-    # All /api/* routes require auth token
     if path.startswith("/api/"):
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
         if token not in ACTIVE_TOKENS:
             return Response(content='{"error":"unauthorized"}', status_code=401,
-                           media_type="application/json")
+                            media_type="application/json")
     return await call_next(request)
 
-# Allow requests from the Vite frontend
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Config helpers ────────────────────────────────────────────────────────────
-ALERT_CONFIG_FILE = Path("alerts_config.json")
-SENT_ALERTS_FILE  = Path("sent_alerts.json")
-REMINDER_DAYS     = [3, 2, 1]
-CURRENCY_SYMBOLS  = {"USD": "$", "NGN": "₦", "GBP": "£", "EUR": "€"}
+# ── Per-user data isolation ────────────────────────────────────────────────────
+
+def user_dir(email: str) -> Path:
+    """Return (and create) an isolated data directory for this email."""
+    safe = hashlib.md5(email.lower().strip().encode()).hexdigest()[:16]
+    d = Path("data") / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def load_config() -> dict:
-    if ALERT_CONFIG_FILE.exists():
+def current_email(request: Request) -> str:
+    """Extract the email associated with the bearer token."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    return ACTIVE_TOKENS.get(token, "")
+
+
+# ── Config helpers (per-user) ──────────────────────────────────────────────────
+REMINDER_DAYS = [3, 2, 1]
+CURRENCY_SYMBOLS = {"USD": "$", "NGN": "₦", "GBP": "£", "EUR": "€"}
+
+
+def load_config(email: str) -> dict:
+    cfg_file = user_dir(email) / "alerts_config.json"
+    if cfg_file.exists():
         try:
-            return json.loads(ALERT_CONFIG_FILE.read_text())
+            return json.loads(cfg_file.read_text())
         except Exception:
             pass
     return {}
 
 
-def save_config(cfg: dict):
-    ALERT_CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+def save_config(email: str, cfg: dict):
+    (user_dir(email) / "alerts_config.json").write_text(json.dumps(cfg, indent=2))
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
+# ── Telegram ───────────────────────────────────────────────────────────────────
 def send_telegram(token: str, chat_id: str, text: str) -> bool:
     import urllib.request
     try:
@@ -107,21 +126,17 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 
 
 def build_scan_summary(report: dict) -> str:
-    """Build a Telegram-friendly scan summary message."""
     lines = ["*SubTrack — Scan Complete* 📊\n"]
     count = report.get("merchant_count", 0)
     spend = report.get("spend_by_currency", {})
-
     lines.append(f"👀 *{count}* active subscription{'s' if count != 1 else ''}")
     if spend:
         lines.append("💳 Monthly: *" + " · ".join(
             f"{CURRENCY_SYMBOLS.get(c, c)}{a:,.2f}" for c, a in spend.items()
         ) + "*")
-
     for m in report.get("merchants", []):
         sym = CURRENCY_SYMBOLS.get(m["currency"], m["currency"] + " ")
         lines.append(f"• {m['merchant']} — {sym}{m['monthly_cost']:,.2f}/mo")
-
     renewals = report.get("upcoming_renewals_30d", [])
     if renewals:
         lines.append("\n*⏰ Upcoming renewals (30 days):*")
@@ -130,23 +145,20 @@ def build_scan_summary(report: dict) -> str:
             lines.append(f"• *{r['merchant']}* — {sym}{r['amount']:,.2f} in {r['days_until']}d ({r['renewal_date']})")
     else:
         lines.append("\n✅ No renewals due in the next 30 days")
-
     return "\n".join(lines)
 
 
-def fire_renewal_reminders(report: dict, token: str, chat_id: str) -> int:
-    """Send Telegram reminders for renewals 3, 2, or 1 day(s) away (deduped)."""
+def fire_renewal_reminders(report: dict, email: str, tg_token: str, chat_id: str) -> int:
     from datetime import date
     renewals = report.get("upcoming_renewals_30d", [])
     today = date.today()
-
+    sent_file = user_dir(email) / "sent_alerts.json"
     sent: dict = {}
-    if SENT_ALERTS_FILE.exists():
+    if sent_file.exists():
         try:
-            sent = json.loads(SENT_ALERTS_FILE.read_text())
+            sent = json.loads(sent_file.read_text())
         except Exception:
             pass
-
     count = 0
     for r in renewals:
         days = r.get("days_until", 999)
@@ -163,180 +175,146 @@ def fire_renewal_reminders(report: dict, token: str, chat_id: str) -> int:
             f"Amount: *{sym}{r['amount']:,.2f}*\n\n"
             f"If you don\u2019t wish to continue, cancel now."
         )
-        if send_telegram(token, chat_id, msg):
+        if send_telegram(tg_token, chat_id, msg):
             sent[key] = today.isoformat()
             count += 1
-            log.info(f"Reminder sent: {r['merchant']} in {days}d")
-
     if count:
-        SENT_ALERTS_FILE.write_text(json.dumps(sent, indent=2))
+        sent_file.write_text(json.dumps(sent, indent=2))
     return count
 
 
-# ── Scan state ────────────────────────────────────────────────────────────────
-class Credentials(BaseModel):
-    email: str
-    password: str
+# ── Per-user scan state ────────────────────────────────────────────────────────
+# email → state dict
+scan_states: Dict[str, dict] = {}
 
-
-scan_state = {
-    "is_running": False,
-    "total": 100,
-    "current": 0,
-    "recent_log": "",
-    "error": None,
-    "done": False,
-}
+def get_scan_state(email: str) -> dict:
+    if email not in scan_states:
+        scan_states[email] = {
+            "is_running": False, "total": 100, "current": 0,
+            "recent_log": "", "error": None, "done": False,
+        }
+    return scan_states[email]
 
 
 def scan_worker(email: str, password: str):
-    global scan_state
-    scan_state["is_running"] = True
-    scan_state["done"] = False
-    scan_state["error"] = None
+    state = get_scan_state(email)
+    state.update({"is_running": True, "done": False, "error": None})
+    udir = user_dir(email)
 
     def progress_callback(current, total, record):
-        scan_state["current"] = current
-        scan_state["total"] = max(total, 1)
+        state["current"] = current
+        state["total"] = max(total, 1)
         if record:
-            merchant = record.get("merchant", "Unknown")
-            scan_state["recent_log"] = f"Processed {merchant}..."
+            state["recent_log"] = f"Processed {record.get('merchant', 'Unknown')}..."
 
     try:
-        # 1. Run the parser
-        scan_state["recent_log"] = "Connecting to IMAP server..."
-        parser.run_parser(email, password, progress_callback=progress_callback)
+        state["recent_log"] = "Connecting to IMAP server..."
+        parser.run_parser(email, password,
+                          progress_callback=progress_callback,
+                          output_file=str(udir / "subscriptions.jsonl"))
 
-        # 2. Run the analyzer
-        scan_state["recent_log"] = "Analyzing results..."
-        report_data = analyzer.run_analysis()
-        with open("report.json", "w") as f:
-            json.dump(report_data, f)
+        state["recent_log"] = "Analyzing results..."
+        report_data = analyzer.run_analysis(filepath=udir / "subscriptions.jsonl")
+        (udir / "report.json").write_text(json.dumps(report_data))
 
-        scan_state["done"] = True
+        state["done"] = True
 
-        # 3. Send Telegram summary after scan
-        cfg = load_config()
+        cfg = load_config(email)
         tg_token = cfg.get("telegram_token", "").strip()
         tg_chat_id = cfg.get("telegram_chat_id", "").strip()
         if tg_token and tg_chat_id:
-            summary = build_scan_summary(report_data)
-            send_telegram(tg_token, tg_chat_id, summary)
-            log.info("Telegram scan summary sent.")
+            send_telegram(tg_token, tg_chat_id, build_scan_summary(report_data))
+            fire_renewal_reminders(report_data, email, tg_token, tg_chat_id)
 
-            # Also check for renewal reminders
-            reminded = fire_renewal_reminders(report_data, tg_token, tg_chat_id)
-            if reminded:
-                log.info(f"Sent {reminded} renewal reminder(s).")
-
-        # Update last_scan timestamp
         cfg["last_scan"] = datetime.now(timezone.utc).isoformat()
-        save_config(cfg)
+        save_config(email, cfg)
 
     except Exception as e:
-        scan_state["error"] = str(e)
+        state["error"] = str(e)
+        log.error(f"Scan error for {email}: {e}")
     finally:
-        scan_state["is_running"] = False
+        state["is_running"] = False
 
 
-# ── Scheduled background jobs ─────────────────────────────────────────────────
-def scheduled_weekly_scan():
-    """Run a full scan using saved credentials — called by the scheduler."""
-    cfg = load_config()
-    email = cfg.get("email_addr", "").strip()
-    password = cfg.get("app_password", "").strip()
-    if not email or not password:
-        log.warning("Scheduled scan skipped — no saved credentials.")
-        return
-    log.info("Starting scheduled weekly scan...")
-    scan_worker(email, password)
+# ── Per-user cancellation marks ────────────────────────────────────────────────
+marked_per_user: Dict[str, set] = {}
+
+def get_marked(email: str) -> set:
+    if email not in marked_per_user:
+        marked_per_user[email] = set()
+    return marked_per_user[email]
 
 
-def scheduled_daily_reminders():
-    """Check for renewal reminders using the latest report — no Gmail scan."""
-    cfg = load_config()
-    tg_token = cfg.get("telegram_token", "").strip()
-    tg_chat_id = cfg.get("telegram_chat_id", "").strip()
-    if not tg_token or not tg_chat_id:
-        log.warning("Reminder check skipped — no Telegram credentials.")
-        return
-
-    report = analyzer.run_analysis()
-    reminded = fire_renewal_reminders(report, tg_token, tg_chat_id)
-    log.info(f"Daily reminder check: {reminded} reminder(s) sent.")
-
-
+# ── Scheduled background jobs ──────────────────────────────────────────────────
 def run_scheduler():
-    """Background thread: weekly scan (Mondays 08:00) + daily reminders (09:00)."""
     import schedule
 
-    schedule.every().monday.at("08:00").do(scheduled_weekly_scan)
-    schedule.every().day.at("09:00").do(scheduled_daily_reminders)
+    def daily_reminders_all_users():
+        for email_hash_dir in Path("data").iterdir():
+            cfg_file = email_hash_dir / "alerts_config.json"
+            report_file = email_hash_dir / "report.json"
+            if not cfg_file.exists() or not report_file.exists():
+                continue
+            try:
+                cfg = json.loads(cfg_file.read_text())
+                tg_token = cfg.get("telegram_token", "").strip()
+                tg_chat_id = cfg.get("telegram_chat_id", "").strip()
+                email = cfg.get("email_addr", "").strip()
+                if not tg_token or not tg_chat_id or not email:
+                    continue
+                report = json.loads(report_file.read_text())
+                fire_renewal_reminders(report, email, tg_token, tg_chat_id)
+            except Exception as exc:
+                log.warning(f"Reminder check failed for {email_hash_dir.name}: {exc}")
 
-    log.info("Scheduler started — weekly scan Mon 08:00, daily reminders 09:00")
-
-    # Fire reminders immediately on startup if a report exists
-    if os.path.exists("report.json"):
-        try:
-            scheduled_daily_reminders()
-        except Exception as exc:
-            log.warning(f"Startup reminder check failed: {exc}")
+    schedule.every().day.at("09:00").do(daily_reminders_all_users)
+    log.info("Scheduler started — daily reminders at 09:00 for all users")
 
     while True:
         schedule.run_pending()
         time.sleep(30)
 
 
-# ── API routes ────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
-    """Start the scheduler thread when the API server boots."""
+    Path("data").mkdir(exist_ok=True)
     t = threading.Thread(target=run_scheduler, daemon=True)
     t.start()
-    log.info("Background scheduler thread launched.")
 
 
-@app.get("/api/report")
-def get_report() -> Dict[str, Any]:
-    try:
-        if not os.path.exists("report.json"):
-            return {"error": "Report not found. Please run the parser first."}
-        with open("report.json", "r") as f:
-            return json.load(f)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# ── API routes ─────────────────────────────────────────────────────────────────
 @app.post("/api/connect")
-def connect_email(creds: Credentials):
-    global scan_state
-    if scan_state["is_running"]:
+def connect_email(creds: "Credentials", request: Request):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if token in ACTIVE_TOKENS:
+        ACTIVE_TOKENS[token] = creds.email  # bind email to this session token
+
+    state = get_scan_state(creds.email)
+    if state["is_running"]:
         return {"status": "error", "message": "A scan is already running."}
 
-    # Save credentials for scheduled scans
-    cfg = load_config()
+    cfg = load_config(creds.email)
     cfg["email_addr"] = creds.email
     cfg["app_password"] = creds.password
-    save_config(cfg)
+    save_config(creds.email, cfg)
 
-    # Start the background worker
     threading.Thread(target=scan_worker, args=(creds.email, creds.password), daemon=True).start()
     return {"status": "success", "message": "Scan started."}
 
 
 @app.get("/api/progress")
-def get_progress():
-    global scan_state
-    if scan_state["error"]:
-        return {"status": "error", "message": scan_state["error"]}
-    if scan_state["done"]:
+def get_progress(request: Request):
+    email = current_email(request)
+    state = get_scan_state(email)
+    if state["error"]:
+        return {"status": "error", "message": state["error"]}
+    if state["done"]:
         return {"status": "done"}
-
     return {
         "status": "scanning",
-        "processed": scan_state["current"],
-        "total": scan_state["total"],
-        "recent_log": scan_state["recent_log"],
+        "processed": state["current"],
+        "total": state["total"],
+        "recent_log": state["recent_log"],
     }
 
 
@@ -345,19 +323,29 @@ def cancel_scan():
     return {"status": "success"}
 
 
-# ── Manual subscription entry ─────────────────────────────────────────────────
+@app.get("/api/report")
+def get_report(request: Request):
+    email = current_email(request)
+    report_file = user_dir(email) / "report.json"
+    if not report_file.exists():
+        return {"error": "No report found. Please run the scanner first."}
+    try:
+        return json.loads(report_file.read_text())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class ManualSubscription(BaseModel):
     merchant: str
     amount: float
     currency: str = "USD"
     frequency: str = "monthly"
-    date: str = ""  # ISO date string
+    date: str = ""
 
 
 @app.post("/api/subscriptions/add")
-def add_subscription(sub: ManualSubscription):
-    """Add a manual subscription to subscriptions.jsonl and re-run analysis."""
-    import hashlib
+def add_subscription(sub: ManualSubscription, request: Request):
+    email = current_email(request)
     if not sub.merchant.strip():
         return {"status": "error", "message": "Service name is required."}
 
@@ -376,13 +364,12 @@ def add_subscription(sub: ManualSubscription):
         "frequency_override": sub.frequency,
         "parsed_at": datetime.now(timezone.utc).isoformat(),
     }
-    with open("subscriptions.jsonl", "a") as f:
+    udir = user_dir(email)
+    with open(udir / "subscriptions.jsonl", "a") as f:
         f.write(json.dumps(record) + "\n")
 
-    # Re-run analysis and update report
-    report_data = analyzer.run_analysis()
-    with open("report.json", "w") as f:
-        json.dump(report_data, f)
+    report_data = analyzer.run_analysis(filepath=udir / "subscriptions.jsonl")
+    (udir / "report.json").write_text(json.dumps(report_data))
 
     return {
         "status": "success",
@@ -390,7 +377,7 @@ def add_subscription(sub: ManualSubscription):
     }
 
 
-# ── Cancellation links ────────────────────────────────────────────────────────
+# ── Cancellation links ─────────────────────────────────────────────────────────
 CANCELLATION_LINKS = {
     "netflix": "https://www.netflix.com/cancel",
     "spotify": "https://www.spotify.com/account/subscription/",
@@ -475,21 +462,14 @@ def get_cancellation_link(merchant: str) -> str:
     return best_url
 
 
-# Persistent set of merchants marked for cancellation
-_marked_for_cancellation: set = set()
-
-
 @app.get("/api/cancellation")
-def get_cancellation_info():
-    """Return cancellation links and marked subscriptions."""
-    report = {}
-    if os.path.exists("report.json"):
-        with open("report.json") as f:
-            report = json.load(f)
-
-    merchants = report.get("merchants", [])
+def get_cancellation_info(request: Request):
+    email = current_email(request)
+    report_file = user_dir(email) / "report.json"
+    report = json.loads(report_file.read_text()) if report_file.exists() else {}
+    marked = get_marked(email)
     result = []
-    for m in merchants:
+    for m in report.get("merchants", []):
         cancel_url = get_cancellation_link(m["merchant"])
         result.append({
             "merchant": m["merchant"],
@@ -499,9 +479,9 @@ def get_cancellation_info():
             "frequency": m.get("frequency", "monthly"),
             "cancel_url": cancel_url or f"https://www.google.com/search?q={m['merchant']}+cancel+subscription",
             "has_direct_link": bool(cancel_url),
-            "marked": m["merchant"] in _marked_for_cancellation,
+            "marked": m["merchant"] in marked,
         })
-    return {"subscriptions": result, "marked_count": len(_marked_for_cancellation)}
+    return {"subscriptions": result, "marked_count": len(marked)}
 
 
 class MarkCancellation(BaseModel):
@@ -510,46 +490,39 @@ class MarkCancellation(BaseModel):
 
 
 @app.post("/api/cancellation/mark")
-def mark_for_cancellation(data: MarkCancellation):
-    """Toggle mark/unmark a subscription for cancellation."""
+def mark_for_cancellation(data: MarkCancellation, request: Request):
+    email = current_email(request)
+    marked = get_marked(email)
     if data.mark:
-        _marked_for_cancellation.add(data.merchant)
+        marked.add(data.merchant)
     else:
-        _marked_for_cancellation.discard(data.merchant)
-    return {"status": "success", "marked": list(_marked_for_cancellation)}
+        marked.discard(data.merchant)
+    return {"status": "success", "marked": list(marked)}
 
 
-# ── Health score ──────────────────────────────────────────────────────────────
 @app.get("/api/health-score")
-def get_health_scores():
-    """Compute a health score for each subscription based on usage signals."""
-    report = {}
-    if os.path.exists("report.json"):
-        with open("report.json") as f:
-            report = json.load(f)
+def get_health_scores(request: Request):
+    email = current_email(request)
+    report_file = user_dir(email) / "report.json"
+    report = json.loads(report_file.read_text()) if report_file.exists() else {}
 
     from datetime import date as date_type
     today = date_type.today()
     results = []
 
     for m in report.get("merchants", []):
-        score = 50  # Base score
-        label = "Fair"
+        score = 50
         tips = []
-
-        # Factor 1: Charge frequency — more charges = more active
         charges = m.get("charge_count", 1)
         if charges >= 6:
             score += 20
         elif charges >= 3:
             score += 10
 
-        # Factor 2: Recency — how recently was the last charge?
         last_charge = m.get("last_charge", "")
         if last_charge:
             try:
-                last_dt = date_type.fromisoformat(last_charge)
-                days_ago = (today - last_dt).days
+                days_ago = (today - date_type.fromisoformat(last_charge)).days
                 if days_ago <= 30:
                     score += 20
                 elif days_ago <= 60:
@@ -560,38 +533,24 @@ def get_health_scores():
             except ValueError:
                 pass
 
-        # Factor 3: Is it marked as forgotten by the analyzer?
         if m.get("is_forgotten"):
             score -= 20
             tips.append("Flagged as potentially forgotten")
 
-        # Factor 4: Cost relative to total
         cost = m.get("monthly_cost", 0)
         if cost > 50:
             tips.append("High-cost subscription — verify it's worth it")
         elif cost < 5:
-            score += 5  # Low cost = less risky
+            score += 5
 
-        # Factor 5: Overlaps
-        overlaps = report.get("overlaps", [])
-        for ov in overlaps:
+        for ov in report.get("overlaps", []):
             if m["merchant"] in (ov.get("merchant_a"), ov.get("merchant_b")):
                 score -= 15
                 tips.append(f"Overlaps with another service in '{ov['category']}'")
                 break
 
-        # Clamp and label
         score = max(0, min(100, score))
-        if score >= 75:
-            label = "Healthy"
-        elif score >= 50:
-            label = "Fair"
-        elif score >= 25:
-            label = "Review"
-        else:
-            label = "Cancel?"
-
-        sym = CURRENCY_SYMBOLS.get(m.get("currency", "USD"), "$")
+        label = "Healthy" if score >= 75 else "Fair" if score >= 50 else "Review" if score >= 25 else "Cancel?"
         results.append({
             "merchant": m["merchant"],
             "category": m.get("category", "Other"),
@@ -604,15 +563,14 @@ def get_health_scores():
             "last_charge": last_charge,
         })
 
-    # Sort worst scores first
     results.sort(key=lambda x: x["score"])
     return {"subscriptions": results}
 
 
 @app.get("/api/alerts/config")
-def get_alerts_config():
-    """Return the current alert configuration (tokens censored)."""
-    cfg = load_config()
+def get_alerts_config(request: Request):
+    email = current_email(request)
+    cfg = load_config(email)
     return {
         "telegram_configured": bool(cfg.get("telegram_token", "").strip()),
         "telegram_chat_id": cfg.get("telegram_chat_id", ""),
@@ -628,37 +586,35 @@ class AlertConfig(BaseModel):
 
 
 @app.post("/api/alerts/config")
-def update_alerts_config(config: AlertConfig):
-    """Update Telegram and WhatsApp alert configuration."""
-    cfg = load_config()
+def update_alerts_config(config: AlertConfig, request: Request):
+    email = current_email(request)
+    cfg = load_config(email)
     if config.telegram_token.strip():
         cfg["telegram_token"] = config.telegram_token.strip()
     if config.telegram_chat_id.strip():
         cfg["telegram_chat_id"] = config.telegram_chat_id.strip()
     cfg["whatsapp_number"] = config.whatsapp_number.strip()
-    save_config(cfg)
+    save_config(email, cfg)
     return {"status": "success", "message": "Alert configuration saved."}
 
 
 @app.post("/api/alerts/test")
-def test_telegram_alert():
-    """Send a test Telegram message."""
-    cfg = load_config()
+def test_telegram_alert(request: Request):
+    email = current_email(request)
+    cfg = load_config(email)
     token = cfg.get("telegram_token", "").strip()
     chat_id = cfg.get("telegram_chat_id", "").strip()
     if not token or not chat_id:
         return {"status": "error", "message": "No Telegram credentials configured."}
-
-    ok = send_telegram(token, chat_id, "✅ *SubTrack* — Test message received! Alerts are working.")
-    if ok:
-        return {"status": "success", "message": "Test message sent!"}
-    return {"status": "error", "message": "Failed to send. Check your token and chat ID."}
+    ok = send_telegram(token, chat_id, "✅ *SubTrack* — Test message received!")
+    return {"status": "success" if ok else "error",
+            "message": "Test message sent!" if ok else "Failed. Check token and chat ID."}
 
 
 @app.get("/api/scheduler/status")
-def scheduler_status():
-    """Return scheduler status information."""
-    cfg = load_config()
+def scheduler_status(request: Request):
+    email = current_email(request)
+    cfg = load_config(email)
     return {
         "last_scan": cfg.get("last_scan", "Never"),
         "weekly_scan": "Mondays 08:00",
@@ -668,14 +624,13 @@ def scheduler_status():
     }
 
 
-# ── Serve React frontend build ────────────────────────────────────────────────
+# ── Serve React frontend ───────────────────────────────────────────────────────
 FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
 if FRONTEND_DIR.is_dir():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="assets")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
-        """Serve the React SPA for any non-API route."""
         file_path = FRONTEND_DIR / full_path
         if file_path.is_file():
             return FileResponse(str(file_path))
