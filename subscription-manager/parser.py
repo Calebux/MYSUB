@@ -431,6 +431,101 @@ def run_parser(
     return new_records
 
 
+# ── Gmail API / OAuth parser ──────────────────────────────────────────────────
+def run_parser_oauth(
+    email_addr: str,
+    creds_dict: dict,
+    progress_callback=None,
+    output_file: str = None,
+) -> list[dict]:
+    """
+    Scan Gmail using OAuth2 credentials (no App Password needed).
+    Uses the Gmail API instead of IMAP — same parsing logic.
+    """
+    import base64
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build as gbuild
+
+    creds = Credentials(
+        token=creds_dict.get("token"),
+        refresh_token=creds_dict.get("refresh_token"),
+        token_uri=creds_dict.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=creds_dict.get("client_id"),
+        client_secret=creds_dict.get("client_secret"),
+        scopes=creds_dict.get("scopes"),
+    )
+
+    service = gbuild("gmail", "v1", credentials=creds)
+    since_date = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y/%m/%d")
+    query = f"category:subscriptions after:{since_date}"
+
+    # Collect all matching message IDs
+    messages: list[dict] = []
+    page_token = None
+    while True:
+        result = service.users().messages().list(
+            userId="me", q=query, maxResults=500, pageToken=page_token
+        ).execute()
+        messages.extend(result.get("messages", []))
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+    log.info(f"Gmail API: {len(messages)} candidate messages.")
+
+    out_path = Path(output_file) if output_file else OUTPUT_FILE
+    already_parsed: set = set()
+    if out_path.exists():
+        with out_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        already_parsed.add(json.loads(line)["id"])
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+    new_records: list[dict] = []
+    processed = 0
+
+    with out_path.open("a") as out_f:
+        for i, msg in enumerate(messages):
+            msg_id = msg["id"]
+            if msg_id in already_parsed:
+                if progress_callback:
+                    progress_callback(i + 1, len(messages), None)
+                continue
+
+            try:
+                full_msg = service.users().messages().get(
+                    userId="me", id=msg_id, format="raw"
+                ).execute()
+                raw_bytes = base64.urlsafe_b64decode(full_msg["raw"] + "==")
+            except Exception as exc:
+                log.warning(f"Failed to fetch message {msg_id}: {exc}")
+                if progress_callback:
+                    progress_callback(i + 1, len(messages), None)
+                continue
+
+            record = parse_email(raw_bytes, msg_id)
+            if record is None:
+                if progress_callback:
+                    progress_callback(i + 1, len(messages), None)
+                continue
+
+            already_parsed.add(msg_id)
+            new_records.append(record)
+            out_f.write(json.dumps(record) + "\n")
+            out_f.flush()
+            processed += 1
+            log.info(f"[{processed}] {record['merchant']} | {record['currency']} {record['amount']}")
+
+            if progress_callback:
+                progress_callback(i + 1, len(messages), record)
+
+    log.info(f"Done. Parsed {processed} new emails → {out_path}")
+    return new_records
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     addr, pwd = load_credentials()

@@ -50,8 +50,19 @@ function App() {
   const [markedForCancel, setMarkedForCancel] = useState<Set<string>>(new Set());
   const [healthScores, setHealthScores] = useState<any[]>([]);
 
-  // Silently obtain auth token on startup so all API calls work
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sessionToken = params.get('session_token');
+
+    if (sessionToken) {
+      // Coming back from Google OAuth — store token and jump to scanning
+      localStorage.setItem('subtrack_token', sessionToken);
+      window.history.replaceState({}, '', '/');
+      setStep(2);
+      return;
+    }
+
+    // Silently obtain an API token on first load
     if (!localStorage.getItem('subtrack_token')) {
       fetch('/auth/login', {
         method: 'POST',

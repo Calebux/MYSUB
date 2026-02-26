@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from typing import Dict, Any
 import json
 import os
@@ -15,6 +15,24 @@ from pathlib import Path
 from pydantic import BaseModel
 import parser
 import analyzer
+
+# Allow OAuth over plain HTTP for local dev (ngrok terminates SSL externally)
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
+# ── Google OAuth config ────────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+BASE_URL             = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
+REDIRECT_URI         = f"{BASE_URL}/auth/google/callback"
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "openid",
+    "email",
+    "profile",
+]
+
+from dotenv import load_dotenv
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("api")
@@ -43,6 +61,94 @@ def auth_login(req: LoginRequest):
         ACTIVE_TOKENS[token] = ""
         return {"status": "success", "token": token}
     return {"status": "error", "message": "Wrong password."}
+
+
+@app.get("/auth/google/login")
+def google_login():
+    """Redirect the user to Google's OAuth consent screen."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return Response(
+            content="GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not configured.",
+            status_code=500,
+        )
+    from google_auth_oauthlib.flow import Flow
+    flow = Flow.from_client_config(
+        {"web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }},
+        scopes=GOOGLE_SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    return RedirectResponse(auth_url)
+
+
+@app.get("/auth/google/callback")
+def google_callback(code: str = "", error: str = ""):
+    """Handle the OAuth2 callback from Google."""
+    if error or not code:
+        return RedirectResponse("/?oauth_error=1")
+
+    from google_auth_oauthlib.flow import Flow
+    flow = Flow.from_client_config(
+        {"web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }},
+        scopes=GOOGLE_SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        log.error(f"OAuth token fetch failed: {exc}")
+        return RedirectResponse("/?oauth_error=1")
+
+    credentials = flow.credentials
+
+    # Get the user's email address from Google
+    import urllib.request as _ur
+    try:
+        req = _ur.Request(
+            f"https://www.googleapis.com/oauth2/v2/userinfo?access_token={credentials.token}"
+        )
+        user_info = json.loads(_ur.urlopen(req, timeout=10).read())
+        email = user_info["email"]
+    except Exception as exc:
+        log.error(f"Failed to get user info: {exc}")
+        return RedirectResponse("/?oauth_error=1")
+
+    # Store OAuth tokens in the user's data directory
+    token_data = {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": list(credentials.scopes) if credentials.scopes else GOOGLE_SCOPES,
+    }
+    udir = user_dir(email)
+    (udir / "oauth_token.json").write_text(json.dumps(token_data))
+
+    # Create session token bound to this email
+    session_token = secrets.token_urlsafe(32)
+    ACTIVE_TOKENS[session_token] = email
+
+    # Start the scan immediately
+    state_obj = get_scan_state(email)
+    if not state_obj["is_running"]:
+        threading.Thread(target=scan_worker, args=(email,), daemon=True).start()
+
+    return RedirectResponse(f"/?session_token={session_token}")
 
 
 @app.middleware("http")
@@ -196,7 +302,7 @@ def get_scan_state(email: str) -> dict:
     return scan_states[email]
 
 
-def scan_worker(email: str, password: str):
+def scan_worker(email: str, password: str = None):
     state = get_scan_state(email)
     state.update({"is_running": True, "done": False, "error": None})
     udir = user_dir(email)
@@ -208,10 +314,20 @@ def scan_worker(email: str, password: str):
             state["recent_log"] = f"Processed {record.get('merchant', 'Unknown')}..."
 
     try:
-        state["recent_log"] = "Connecting to IMAP server..."
-        parser.run_parser(email, password,
-                          progress_callback=progress_callback,
-                          output_file=str(udir / "subscriptions.jsonl"))
+        oauth_file = udir / "oauth_token.json"
+        if oauth_file.exists():
+            state["recent_log"] = "Connecting to Gmail..."
+            creds_dict = json.loads(oauth_file.read_text())
+            parser.run_parser_oauth(email, creds_dict,
+                                    progress_callback=progress_callback,
+                                    output_file=str(udir / "subscriptions.jsonl"))
+        elif password:
+            state["recent_log"] = "Connecting to IMAP server..."
+            parser.run_parser(email, password,
+                              progress_callback=progress_callback,
+                              output_file=str(udir / "subscriptions.jsonl"))
+        else:
+            raise ValueError("No OAuth token or app password available.")
 
         state["recent_log"] = "Analyzing results..."
         report_data = analyzer.run_analysis(filepath=udir / "subscriptions.jsonl")
