@@ -43,6 +43,22 @@ app = FastAPI(title="SubTrack API")
 ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "subtrack")
 # token → email (empty string until the user calls /api/connect)
 ACTIVE_TOKENS: Dict[str, str] = {}
+TOKENS_FILE = Path("data/tokens.json")
+
+
+def load_tokens_from_disk():
+    """Restore token→email mapping after a server restart."""
+    if TOKENS_FILE.exists():
+        try:
+            ACTIVE_TOKENS.update(json.loads(TOKENS_FILE.read_text()))
+            log.info(f"Restored {len(ACTIVE_TOKENS)} session token(s) from disk.")
+        except Exception:
+            pass
+
+
+def save_tokens_to_disk():
+    TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKENS_FILE.write_text(json.dumps(ACTIVE_TOKENS, indent=2))
 
 
 class LoginRequest(BaseModel):
@@ -59,6 +75,7 @@ def auth_login(req: LoginRequest):
     if req.password == ACCESS_PASSWORD:
         token = secrets.token_urlsafe(32)
         ACTIVE_TOKENS[token] = ""
+        save_tokens_to_disk()
         return {"status": "success", "token": token}
     return {"status": "error", "message": "Wrong password."}
 
@@ -394,6 +411,7 @@ def run_scheduler():
 @app.on_event("startup")
 def on_startup():
     Path("data").mkdir(exist_ok=True)
+    load_tokens_from_disk()
     t = threading.Thread(target=run_scheduler, daemon=True)
     t.start()
 
@@ -404,6 +422,7 @@ def connect_email(creds: "Credentials", request: Request):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
     if token in ACTIVE_TOKENS:
         ACTIVE_TOKENS[token] = creds.email  # bind email to this session token
+        save_tokens_to_disk()
 
     state = get_scan_state(creds.email)
     if state["is_running"]:
