@@ -43,7 +43,17 @@ interface Report {
   overlaps: any[];
 }
 function App() {
-  const [step, setStep] = useState(1);
+  const [step, setStep] = useState(() => {
+    const saved = localStorage.getItem('subtrack_step');
+    const n = saved ? parseInt(saved) : 1;
+    // Only restore results/actions steps — scanning/connect restart fresh
+    return n >= 3 ? n : 1;
+  });
+
+  // Persist step so page reloads land back in the right place
+  useEffect(() => {
+    localStorage.setItem('subtrack_step', step.toString());
+  }, [step]);
   const [report, setReport] = useState<Report | null>(null);
   const [loading, setLoading] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
