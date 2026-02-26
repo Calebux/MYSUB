@@ -1,5 +1,5 @@
 # MYSUB
-# SubTrack — Subscription Management Tool
+
 # SubTrack — Subscription Intelligence Dashboard
 
 Automatically discovers and analyzes your subscription charges from Gmail, detects duplicates, finds forgotten services, and predicts upcoming renewals.
