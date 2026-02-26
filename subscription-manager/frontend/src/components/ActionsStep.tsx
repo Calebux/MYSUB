@@ -1,9 +1,68 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Download, Bell, Send, CheckCircle2 } from 'lucide-react';
+import { apiFetch } from '../api';
 
 export default function ActionsStep({ report, goBack }: { report: any, goBack: () => void }) {
+    const [tgToken, setTgToken] = useState('');
+    const [tgChatId, setTgChatId] = useState('');
     const [tgSaved, setTgSaved] = useState(false);
-    const [waSaved, setWaSaved] = useState(false);
+    const [tgSaving, setTgSaving] = useState(false);
+    const [tgError, setTgError] = useState('');
+    const [tgTesting, setTgTesting] = useState(false);
+    const [tgTestMsg, setTgTestMsg] = useState('');
+
+    // Load existing config on mount
+    useEffect(() => {
+        apiFetch('/api/alerts/config')
+            .then(r => r.json())
+            .then(data => {
+                if (data.telegram_chat_id) setTgChatId(data.telegram_chat_id);
+                if (data.telegram_configured) setTgSaved(true);
+            })
+            .catch(() => {});
+    }, []);
+
+    const handleSaveTelegram = async () => {
+        if (!tgToken.trim() || !tgChatId.trim()) {
+            setTgError('Please enter both Bot Token and Chat ID.');
+            return;
+        }
+        setTgSaving(true);
+        setTgError('');
+        try {
+            const res = await apiFetch('/api/alerts/config', {
+                method: 'POST',
+                body: JSON.stringify({
+                    telegram_token: tgToken.trim(),
+                    telegram_chat_id: tgChatId.trim(),
+                }),
+            });
+            const data = await res.json();
+            if (data.status === 'success') {
+                setTgSaved(true);
+            } else {
+                setTgError(data.message || 'Failed to save.');
+            }
+        } catch {
+            setTgError('Network error.');
+        } finally {
+            setTgSaving(false);
+        }
+    };
+
+    const handleTestTelegram = async () => {
+        setTgTesting(true);
+        setTgTestMsg('');
+        try {
+            const res = await apiFetch('/api/alerts/test', { method: 'POST' });
+            const data = await res.json();
+            setTgTestMsg(data.status === 'success' ? '✓ Test message sent!' : '✗ ' + (data.message || 'Failed'));
+        } catch {
+            setTgTestMsg('✗ Network error.');
+        } finally {
+            setTgTesting(false);
+        }
+    };
 
     const handleDownload = () => {
         const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(report, null, 2));
@@ -15,7 +74,6 @@ export default function ActionsStep({ report, goBack }: { report: any, goBack: (
 
     return (
         <div className="max-w-4xl mx-auto p-8 space-y-8">
-
             <div className="flex items-center justify-between">
                 <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Export & Notifications</h2>
                 <button onClick={goBack} className="text-sm font-semibold text-gray-500 hover:text-slate-900">
@@ -46,25 +104,54 @@ export default function ActionsStep({ report, goBack }: { report: any, goBack: (
 
                 {/* Telegram Card */}
                 <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 flex flex-col items-start justify-between">
-                    <div>
+                    <div className="w-full">
                         <div className="w-10 h-10 bg-blue-50 text-blue-500 rounded-xl flex items-center justify-center mb-4">
                             <Send className="w-5 h-5" />
                         </div>
                         <h3 className="text-lg font-bold text-slate-900 mb-2">Telegram Alerts</h3>
-                        <p className="text-sm text-gray-500 leading-relaxed mb-6">
-                            Get push notifications directly to Telegram 3 days before any subscription renews.
+                        <p className="text-sm text-gray-500 leading-relaxed mb-4">
+                            Get notified on Telegram 3 days before any subscription renews.
                         </p>
-                    </div>
 
-                    <div className="w-full space-y-3">
-                        <input type="text" placeholder="Bot Token" className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-yellow-500 outline-none" />
-                        <input type="text" placeholder="Chat ID" className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-yellow-500 outline-none" />
-                        <button
-                            onClick={() => setTgSaved(true)}
-                            className={`w-full py-2.5 font-semibold rounded-xl transition-all flex justify-center items-center ${tgSaved ? 'bg-emerald-500 text-white' : 'bg-slate-900 text-white hover:bg-slate-800'}`}
-                        >
-                            {tgSaved ? <><CheckCircle2 className="w-4 h-4 mr-2" /> Saved</> : 'Save Telegram Config'}
-                        </button>
+                        {tgError && (
+                            <p className="text-red-500 text-xs mb-3">{tgError}</p>
+                        )}
+                        {tgTestMsg && (
+                            <p className={`text-xs mb-3 font-semibold ${tgTestMsg.startsWith('✓') ? 'text-emerald-600' : 'text-red-500'}`}>{tgTestMsg}</p>
+                        )}
+
+                        <div className="w-full space-y-3">
+                            <input
+                                type="text"
+                                placeholder="Bot Token"
+                                value={tgToken}
+                                onChange={e => { setTgToken(e.target.value); setTgSaved(false); }}
+                                className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-yellow-500 outline-none"
+                            />
+                            <input
+                                type="text"
+                                placeholder="Chat ID"
+                                value={tgChatId}
+                                onChange={e => { setTgChatId(e.target.value); setTgSaved(false); }}
+                                className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-yellow-500 outline-none"
+                            />
+                            <button
+                                onClick={handleSaveTelegram}
+                                disabled={tgSaving}
+                                className={`w-full py-2.5 font-semibold rounded-xl transition-all flex justify-center items-center ${tgSaved ? 'bg-emerald-500 text-white' : 'bg-slate-900 text-white hover:bg-slate-800'} disabled:opacity-50`}
+                            >
+                                {tgSaved ? <><CheckCircle2 className="w-4 h-4 mr-2" /> Saved</> : tgSaving ? 'Saving...' : 'Save Telegram Config'}
+                            </button>
+                            {tgSaved && (
+                                <button
+                                    onClick={handleTestTelegram}
+                                    disabled={tgTesting}
+                                    className="w-full py-2 border border-blue-200 text-blue-600 text-sm font-semibold rounded-xl hover:bg-blue-50 transition-all disabled:opacity-50"
+                                >
+                                    {tgTesting ? 'Sending...' : 'Send Test Message'}
+                                </button>
+                            )}
+                        </div>
                     </div>
                 </div>
 
@@ -79,13 +166,9 @@ export default function ActionsStep({ report, goBack }: { report: any, goBack: (
                             Open WhatsApp to send yourself a summary of your active subscriptions and renewals.
                         </p>
                     </div>
-
                     <div className="w-full space-y-3">
                         <input type="text" placeholder="+1234567890" className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-yellow-500 outline-none" />
-                        <button
-                            onClick={() => setWaSaved(true)}
-                            className={`w-full py-2.5 font-semibold rounded-xl transition-all flex justify-center items-center ${waSaved ? 'bg-emerald-500 text-white' : 'bg-[#25D366] text-white hover:bg-[#1ebd5a]'}`}
-                        >
+                        <button className="w-full py-2.5 font-semibold rounded-xl transition-all flex justify-center items-center bg-[#25D366] text-white hover:bg-[#1ebd5a]">
                             Open WhatsApp
                         </button>
                     </div>
